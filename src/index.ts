@@ -1,12 +1,11 @@
 import { SynorError, MigrationRecord } from '@synor/core';
-// import { performance } from 'perf_hooks';
+import { performance } from 'perf_hooks';
 import { MongoClient, Db } from 'mongodb';
 import { ConnectionString } from 'connection-string';
 
 type DatabaseEngine = import('@synor/core').DatabaseEngine;
 type DatabaseEngineFactory = import('@synor/core').DatabaseEngineFactory;
 type MigrationSource = import('@synor/core').MigrationSource;
-type EngineInput = import('@synor/core').EngineInput;
 
 async function noOp(): Promise<null> {
   await Promise.resolve(null);
@@ -89,10 +88,10 @@ async function updateRecord(
   );
 }
 
-export const MongoDbEngine = async ({
+export const MongoDbEngine: DatabaseEngineFactory = (
   uri,
-  helpers: { baseVersion, getAdvisoryLockId, getUserInfo }
-}: EngineInput): Promise<DatabaseEngine> => {
+  { baseVersion, getAdvisoryLockId, getUserInfo }
+): DatabaseEngine => {
   if (typeof getAdvisoryLockId !== 'function') {
     throw new SynorError(`Missing: getAdvisoryLockId`);
   }
@@ -103,15 +102,19 @@ export const MongoDbEngine = async ({
 
   const { database, migrationRecordTable } = parseConnectionString(uri);
 
-  const client = await MongoClient.connect(uri);
-  const db = await client.db(database);
+  let client: MongoClient | null = null;
+  let db: Db | null = null;
 
   return {
     async open() {
+      client = await MongoClient.connect(uri);
+      db = await client.db(database);
       await ensureMigrationRecordTableExists(db, migrationRecordTable);
     },
     async close() {
-      await client.close();
+      if (client) {
+        await client.close();
+      }
     },
     async lock() {
       await noOp();
@@ -120,6 +123,9 @@ export const MongoDbEngine = async ({
       await noOp();
     },
     async drop() {
+      if (!db) {
+        throw new SynorError('Database connection is null');
+      }
       const collections = await (
         await db.listCollections(
           {},
@@ -129,12 +135,48 @@ export const MongoDbEngine = async ({
         )
       ).toArray();
 
-      await Promise.all(collections.map(async c => db.dropCollection(c)));
+      await Promise.all(
+        collections.map(async c => {
+          if (db) {
+            await db.dropCollection(c);
+          }
+        })
+      );
     },
-    async run(migration: MigrationSource) {
-      await noOp();
+    async run({ version, type, title, hash, run }: MigrationSource) {
+      let dirty = false;
+
+      const startTime = performance.now();
+      try {
+        if (run && db) {
+          await run({
+            db
+          });
+        } else {
+          throw new SynorError('Run function is null');
+        }
+      } catch (err) {
+        dirty = true;
+        console.error('error trying to run migration');
+        throw err;
+      } finally {
+        const endTime = performance.now();
+        await db?.collection(migrationRecordTable).insert({
+          version,
+          type,
+          title,
+          hash,
+          appliedAt: new Date(),
+          appliedBy: '',
+          executionTime: endTime - startTime,
+          dirty
+        });
+      }
     },
     async repair(records) {
+      if (!db) {
+        throw new SynorError('Database connection is null');
+      }
       await deleteDirtyRecords(db, migrationRecordTable);
 
       for (const { id, hash } of records) {
@@ -142,6 +184,10 @@ export const MongoDbEngine = async ({
       }
     },
     async records(startid: number) {
+      if (!db) {
+        throw new SynorError('Database connection is null');
+      }
+
       const records = (await (
         await db.collection(migrationRecordTable).find({
           id: {
