@@ -18,28 +18,30 @@ function parseConnectionString(
   protocol: string;
   host: string;
   port: number;
-  user: string;
-  password: string;
   path: string[];
   params: Record<string, any>;
   database: string;
   migrationRecordTable: string;
 } {
-  const {
-    protocol,
-    hostname: host,
-    port,
-    user,
-    password,
-    path,
-    params
-  } = new ConnectionString(cn, {
-    params: {
-      synor_migration_record_table: 'synor_migration_record'
+  console.log(cn);
+  const { protocol, hostname: host, port, path, params } = new ConnectionString(
+    cn,
+    {
+      params: {
+        synor_migration_record_table: 'synor_migration_record'
+      }
     }
-  });
+  );
 
-  if (!host || !protocol || !port || !user || !password || !path || !params) {
+  console.log(cn);
+
+  console.log('host ', host);
+  console.log('port ', port);
+  console.log('protocol ', protocol);
+  console.log('path ', path);
+  console.log('params ', params);
+
+  if (!host || !protocol || !port || !path || !params) {
     throw new SynorError('Invalid connection uri');
   }
   const database = path?.[0];
@@ -50,19 +52,66 @@ function parseConnectionString(
     host,
     protocol,
     port,
-    user,
-    password,
     path,
     params,
     migrationRecordTable
   };
 }
 
-async function ensureMigrationRecordTableExists(
+async function doesMigrationRecordTableExists(
   db: Db,
   mgCollName: string
+): Promise<boolean> {
+  const collections = await (
+    await db.listCollections(
+      {},
+      {
+        nameOnly: true
+      }
+    )
+  ).toArray();
+  return collections.map(c => c.name).includes(mgCollName);
+}
+
+async function findNextAutoIncrementedId(
+  db: Db,
+  mgCollName: string
+): Promise<number> {
+  const cursor = await db
+    .collection(mgCollName)
+    .find()
+    .sort({ appliedAt: -1 })
+    .limit(1);
+
+  const lastEntry = await cursor.next();
+
+  if (lastEntry?.id) {
+    return (lastEntry.id as number) + 1;
+  }
+  return 1;
+}
+
+async function ensureMigrationRecordTableExists(
+  db: Db,
+  mgCollName: string,
+  version: string
 ): Promise<void> {
-  await db.createCollection(mgCollName);
+  console.log('in ensure function, col name =', mgCollName);
+  if (!(await doesMigrationRecordTableExists(db, mgCollName))) {
+    console.log('adding base level entry');
+    await db.createCollection(mgCollName);
+    await db?.collection(mgCollName).insertOne({
+      version,
+      id: 1,
+      type: 'do',
+      title: 'base entry',
+      hash: '',
+      appliedAt: new Date(),
+      appliedBy: '',
+      executionTime: 0,
+      dirty: false
+    });
+  }
 }
 
 async function deleteDirtyRecords(db: Db, mgCollName: string): Promise<void> {
@@ -107,22 +156,31 @@ export const MongoDbEngine: DatabaseEngineFactory = (
 
   return {
     async open() {
+      console.log('in open function');
       client = await MongoClient.connect(uri);
       db = await client.db(database);
-      await ensureMigrationRecordTableExists(db, migrationRecordTable);
+      await ensureMigrationRecordTableExists(
+        db,
+        migrationRecordTable,
+        baseVersion
+      );
     },
     async close() {
+      console.log('in close function');
       if (client) {
         await client.close();
       }
     },
     async lock() {
+      console.log('in lock function');
       await noOp();
     },
     async unlock() {
+      console.log('in unlock function');
       await noOp();
     },
     async drop() {
+      console.log('in drop function');
       if (!db) {
         throw new SynorError('Database connection is null');
       }
@@ -144,6 +202,7 @@ export const MongoDbEngine: DatabaseEngineFactory = (
       );
     },
     async run({ version, type, title, hash, run }: MigrationSource) {
+      console.log('in run function');
       let dirty = false;
 
       const startTime = performance.now();
@@ -161,7 +220,12 @@ export const MongoDbEngine: DatabaseEngineFactory = (
         throw err;
       } finally {
         const endTime = performance.now();
+        const newRecordId = await findNextAutoIncrementedId(
+          db as Db,
+          migrationRecordTable
+        );
         await db?.collection(migrationRecordTable).insert({
+          id: newRecordId,
           version,
           type,
           title,
@@ -174,6 +238,7 @@ export const MongoDbEngine: DatabaseEngineFactory = (
       }
     },
     async repair(records) {
+      console.log('in repair function');
       if (!db) {
         throw new SynorError('Database connection is null');
       }
@@ -184,6 +249,7 @@ export const MongoDbEngine: DatabaseEngineFactory = (
       }
     },
     async records(startid: number) {
+      console.log('in records function');
       if (!db) {
         throw new SynorError('Database connection is null');
       }
@@ -195,6 +261,7 @@ export const MongoDbEngine: DatabaseEngineFactory = (
           }
         })
       ).toArray()) as MigrationRecord[];
+      console.log(records);
       return records;
     }
   };
